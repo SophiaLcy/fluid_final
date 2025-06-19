@@ -1,15 +1,22 @@
 import numpy as np
 import matplotlib.pyplot as plt
 
+# 设置图像的嵌入字体（本段代码使用 copilot 辅助生成）
+plt.rcParams['text.usetex'] = True
+plt.rcParams['font.family'] = 'serif'
+plt.rcParams['font.serif'] = 'Times New Roman'
+plt.rcParams['xtick.labelsize'] = 15
+plt.rcParams['ytick.labelsize'] = 15
+
 # 网格参数
 gamma = 1.4                                         # 绝热指数
-num_x = 400                                         # 空间网格点数
+num_x = 100                                         # 空间网格点数
 x = np.linspace(-1.5, 1.5, num_x)                   # 计算域 [-1.5, 1.5]
 dx = x[1] - x[0]                                    # 空间步长
-CFL = 0.4                                           # CFL 条件数
+CFL = 0.1                                           # CFL 条件数
 t_final = 1                                         # 演化终止时间
 
-# 数值格式选择
+# 数值格式选择（
 FLUX_TYPE = 'TVD'
 
 # 初值条件
@@ -46,9 +53,6 @@ def calc_flux(U):
 
 # Minmod 限制器 (TVD 格式)
 def minmod(a, b):
-    """
-    Minmod 斜率限制器，用于抑制 TVD 格式中的数值振荡
-    """
     return np.where(a * b > 0, np.sign(a) * np.minimum(np.abs(a), np.abs(b)), 0)
 
 # TVD 格式 (二阶 MUSCL + Lax-Friedrichs 通量)
@@ -73,7 +77,7 @@ def tvd_flux(U):
     U_L = primitive_to_conserved(W_L[0], W_L[1], W_L[2])
     U_R = primitive_to_conserved(W_R[0], W_R[1], W_R[2])
 
-    # 计算 Lax-Friedrichs 数值通量
+    # 计算中心格式界面通量
     flux_L = calc_flux(U_L)
     flux_R = calc_flux(U_R)
     flux_interface = 0.5 * (flux_L + flux_R - alpha * (U_R - U_L))
@@ -166,37 +170,40 @@ def weno_vl_flux(U):
     flux_plus  = np.zeros_like(U)
     flux_minus = np.zeros_like(U)
 
-    # 根据马赫数判断流动状态
+    # 根据马赫数判断流动状态（生成掩码）
     subsonic = np.abs(mach) < 1                     # 亚音速
     supersonic_pos = mach >= 1                      # 超音速（正向）
     supersonic_neg = mach <= -1                     # 超音速（负向）
     
-    # 计算超音速区的正负通量
+    # 计算超音速区域的正负通量
     flux_plus[:, supersonic_pos] = flux[:, supersonic_pos]
     flux_minus[:, supersonic_pos] = 0.0
     flux_plus[:, supersonic_neg] = 0.0
     flux_minus[:, supersonic_neg] = flux[:, supersonic_neg]
 
-    # 提取亚音速区域的变量
+    # 利用掩码截取亚音速区域
     rho_sub, u_sub, c_sub, M_sub = rho[subsonic], u[subsonic], c[subsonic], mach[subsonic]
     
-    # 计算亚音速区的分裂通量 F+
-    f_mass_p = rho_sub * c_sub / 4.0 * (M_sub + 1)**2
+    # 计算亚音速区域的分裂通量 f+
+    f_mass_p = rho_sub * c_sub * (M_sub + 1)**2 / 4.0
     f_mom_p = f_mass_p * ((gamma - 1) * u_sub + 2 * c_sub) / gamma
-    f_eng_p = f_mom_p * (((gamma - 1) * u_sub + 2 * c_sub)**2 / (2 * (gamma**2 - 1)))
+    f_eng_p = f_mass_p * (((gamma - 1) * u_sub + 2 * c_sub)**2 / (2 * (gamma**2 - 1)))
     flux_plus[0, subsonic], flux_plus[1, subsonic], flux_plus[2, subsonic] = f_mass_p, f_mom_p, f_eng_p
     
-    # 计算亚音速区的分裂通量 F-
-    flux_minus[:, subsonic] = flux[:, subsonic] - flux_plus[:, subsonic]
+    # 计算亚音速区域的分裂通量 f-
+    f_mass_m = -rho_sub * c_sub * (M_sub - 1)**2 / 4.0
+    f_mom_m = f_mass_m * ((gamma - 1) * u_sub - 2 * c_sub) / gamma
+    f_eng_m = f_mass_m * (((gamma - 1) * u_sub - 2 * c_sub)**2 / (2 * (gamma**2 - 1)))
+    flux_minus[0, subsonic], flux_minus[1, subsonic], flux_minus[2, subsonic] = f_mass_m, f_mom_m, f_eng_m
 
-
-    # 对分裂后的通量 F+ 和 F- 进行 WENO5 重构
-    FpL, _ = weno5_reconstruct(flux_plus)
-    _, FmR = weno5_reconstruct(flux_minus)
+    # 对 f+ 和 f- 分别进行 WENO5 重构
+    flux_plus_L, _  = weno5_reconstruct(flux_plus)
+    _, flux_minus_R = weno5_reconstruct(flux_minus)
     
-    # 组合得到界面通量
-    FmR_shifted = np.roll(FmR, -1, axis=1)
-    flux_interface = FpL + FmR_shifted
+    # 组合重构后的通量得到界面通量
+    # - 其中 f^{-}_{r} 是在 i+1 单元上重构得到的，需要向左移动一位
+    flux_mines_R_shifted = np.roll(flux_minus_R, -1, axis=1)
+    flux_interface = flux_plus_L + flux_mines_R_shifted
     return flux_interface
 
 # 间断指示器 (混合格式)
@@ -212,8 +219,8 @@ def shock_sensor(U, threshold=0.03):
     
     return (grad_rho / max_grad) > threshold
 
-# 混合通量计算 (WENO/TVD 混合格式)
-def hybrid_flux(U):
+# 混合通量计算 (WENO_LF/TVD 混合格式)
+def hybrid_lf_flux(U):
 
     # 分别计算两种格式的数值通量
     flux_weno = weno_lf_flux(U)
@@ -228,7 +235,27 @@ def hybrid_flux(U):
     shock_interface[:-1] = shock_interface_raw
     shock_mask = np.broadcast_to(shock_interface[:, np.newaxis], (num_x, 3)).T
     
-    # 根据掩码选择通量格式
+    # 根据掩码选择通量格式：在间断处使用 TVD，在光滑区域使用 WENO
+    flux_interface = np.where(shock_mask, flux_weno, flux_tvd)
+    return flux_interface
+
+# 混合通量计算 (WENO_VL/TVD 混合格式)
+def hybrid_vl_flux(U):
+
+    # 分别计算两种格式的数值通量
+    flux_weno = weno_vl_flux(U)
+    flux_tvd = tvd_flux(U)
+
+    # 判断是否位于间断区域
+    shock_indicator = shock_sensor(U)
+    
+    # 创建掩码（本段代码使用 copilot 辅助生成）
+    shock_interface_raw = shock_indicator[:-1] | shock_indicator[1:]
+    shock_interface = np.zeros(num_x, dtype=bool)
+    shock_interface[:-1] = shock_interface_raw
+    shock_mask = np.broadcast_to(shock_interface[:, np.newaxis], (num_x, 3)).T
+    
+    # 根据掩码选择通量格式：在间断处使用 TVD，在光滑区域使用 WENO
     flux_interface = np.where(shock_mask, flux_weno, flux_tvd)
     return flux_interface
 
@@ -277,16 +304,19 @@ time = 0.0                                      # 初始化时间
 # 根据全局设置选择通量计算函数
 if FLUX_TYPE == 'WENO_LF':
     flux_function = weno_lf_flux
-    print("使用 FDS (WENO + Lax-Friedrichs) 方法")
+    print("使用 FVS (WENO + Lax-Friedrichs) 方法")
 elif FLUX_TYPE == 'WENO_VL':
     flux_function = weno_vl_flux
     print("使用 FVS (WENO + Van Leer) 方法")
 elif FLUX_TYPE == 'TVD':
     flux_function = tvd_flux
     print("使用 TVD (MUSCL-Hancock) 方法")
-elif FLUX_TYPE == 'Hybrid':
-    flux_function = hybrid_flux
-    print("使用 Hybrid (WENO/TVD Hybrid) 方法")
+elif FLUX_TYPE == 'HBD_LF':
+    flux_function = hybrid_lf_flux
+    print("使用 Hybrid (WENO_LF/TVD Hybrid) 方法")
+elif FLUX_TYPE == 'HBD_VL':
+    flux_function = hybrid_vl_flux
+    print("使用 Hybrid (WENO_VL/TVD Hybrid) 方法")
 else:
     raise ValueError(f"未知的通量类型: {FLUX_TYPE}")
 
@@ -330,37 +360,37 @@ plt.rcParams['axes.titlesize'] = 15
 plt.rcParams['legend.fontsize'] = 10
 
 # 创建图表，包含三个子图
-fig, axs = plt.subplots(1, 3, figsize=(18, 5))
-fig.suptitle(f'Scheme: {FLUX_TYPE} at t={t_final:.2f}', fontsize=16)
+fig, axs = plt.subplots(3, 1, figsize=(6, 15))
+fig.suptitle(rf'Scheme: {FLUX_TYPE} at $t={t_final:.2f}$\quad($N={num_x}$)', fontsize=18)
 
 # 密度图
 axs[0].plot(x, rho_num, 'b-', label='Numerical')
 if has_exact_solution:
     axs[0].plot(x_exact, rho_exact, 'r--', label='Exact')
-axs[0].set_title(r'Density $\rho$')
-axs[0].set_xlabel(r'$x$')
-axs[0].legend()
+axs[0].set_title(r'Density $\rho$',fontsize=18)
+axs[0].set_xlabel(r'Coordinate $x$',fontsize=18)
+axs[0].legend(fontsize=15)
 axs[0].grid(True)
 
 # 速度图
 axs[1].plot(x, u_num, 'b-', label='Numerical')
 if has_exact_solution:
     axs[1].plot(x_exact, u_exact, 'r--', label='Exact')
-axs[1].set_title(r'Velocity $u$')
-axs[1].set_xlabel(r'$x$')
-axs[1].legend()
+axs[1].set_title(r'Velocity $u$',fontsize=18)
+axs[1].set_xlabel(r'Coordinate $x$',fontsize=18)
+axs[1].legend(fontsize=15)
 axs[1].grid(True)
 
 # 压力图
 axs[2].plot(x, p_num, 'b-', label='Numerical')
 if has_exact_solution:
     axs[2].plot(x_exact, p_exact, 'r--', label='Exact')
-axs[2].set_title(r'Pressure $p$')
-axs[2].set_xlabel(r'$x$')
-axs[2].legend()
+axs[2].set_title(r'Pressure $p$',fontsize=18)
+axs[2].set_xlabel(r'Coordinate $x$',fontsize=18)
+axs[2].legend(fontsize=15)
 axs[2].grid(True)
 
 # 调整布局并保存图像
-plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-plt.savefig(f'Numerical_vs_Exact_{FLUX_TYPE}_N={num_x}.png', dpi=300)
-plt.show()
+plt.tight_layout(rect=[0, 0.05, 1, 0.98])
+plt.savefig(f'{FLUX_TYPE}_N={num_x}.png', dpi=300)
+np.savez(f'{FLUX_TYPE}_N={num_x}_data.npz', x=x, rho=rho, u=u, p=p)
